@@ -1,0 +1,28 @@
+# ======================
+# OS / Editor
+# ======================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ======================
+# Python / Django
+# ======================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.sqlite3
+.env
+.env.*
+venv/
+.env/
+.virtualenv/
+pip-wheel-metadata/
+*.log
+
+# Django
+/staticfiles/
+media/
+local_settings.py 
