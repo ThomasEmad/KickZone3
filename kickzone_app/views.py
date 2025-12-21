@@ -64,7 +64,7 @@ class UserViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['post'])
     def login(self, request):
         """Login a user"""
-        username = request.data.get('username')
+        username = request.data.get('username', '').lower().strip()  # Convert to lowercase to match registration
         password = request.data.get('password')
         
         try:
@@ -100,7 +100,7 @@ class UserViewSet(viewsets.ModelViewSet):
             )
     
     def get_permissions(self):
-        if self.action in ['register', 'login']:
+        if self.action in ['register', 'login', 'directory', 'online_users']:
             permission_classes = []
         else:
             permission_classes = [IsAuthenticated]
@@ -174,6 +174,72 @@ class UserViewSet(viewsets.ModelViewSet):
             'online_users': serializer.data,
             'count': online_users.count()
         })
+    
+    @action(detail=False, methods=['get', 'put'])
+    def profile(self, request):
+        """Get or update current user's profile"""
+        if request.method == 'GET':
+            serializer = self.get_serializer(request.user)
+            return Response(serializer.data)
+        
+        elif request.method == 'PUT':
+            print(f"DEBUG: Profile update request data: {request.data}")
+            print(f"DEBUG: Request user: {request.user.username}")
+            print(f"DEBUG: Content type: {request.content_type}")
+            
+            # Handle FormData conversion for Skill_Level
+            data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
+            
+            # Ensure Skill_Level is properly converted to integer
+            if 'Skill_Level' in data:
+                try:
+                    original_value = data['Skill_Level']
+                    if hasattr(data, 'getlist'):
+                        # Handle multiple values from FormData
+                        skill_level_value = data.getlist('Skill_Level')[0] if data.getlist('Skill_Level') else None
+                    else:
+                        skill_level_value = data.get('Skill_Level')
+                    
+                    if skill_level_value is not None:
+                        data['Skill_Level'] = int(skill_level_value)
+                        print(f"DEBUG: Skill_Level converted from {original_value} to {data['Skill_Level']}")
+                except (ValueError, TypeError) as e:
+                    print(f"DEBUG: Skill_Level conversion error: {e}")
+                    return Response({
+                        'error': 'Invalid Skill_Level value. Must be a number between 1 and 100.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+            
+            print(f"DEBUG: Processed data: {data}")
+            
+            serializer = self.get_serializer(request.user, data=data, partial=True)
+            
+            if not serializer.is_valid():
+                print(f"DEBUG: Serializer errors: {serializer.errors}")
+                return Response({
+                    'error': 'Validation failed',
+                    'details': serializer.errors
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            print("DEBUG: Serializer is valid, saving...")
+            try:
+                updated_user = serializer.save()
+                print(f"DEBUG: User updated successfully: {updated_user.username}")
+                print(f"DEBUG: New Skill_Level: {updated_user.Skill_Level}")
+                
+                # Return updated user data
+                return Response({
+                    'success': True,
+                    'user': UserSerializer(updated_user).data,
+                    'message': 'Profile updated successfully'
+                })
+            except Exception as e:
+                print(f"DEBUG: Save error: {e}")
+                import traceback
+                traceback.print_exc()
+                return Response({
+                    'error': 'Failed to save profile updates',
+                    'details': str(e)
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class PitchViewSet(viewsets.ModelViewSet):
     queryset = Pitch.objects.all()
@@ -318,13 +384,45 @@ class BookingViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if user.user_type == 'owner':
             # Pitch owners can see bookings for their pitches
-            return Booking.objects.filter(pitch__owner=user)
+            queryset = Booking.objects.filter(pitch__owner=user)
         elif user.user_type == 'admin':
             # Admins can see all bookings
-            return Booking.objects.all()
+            queryset = Booking.objects.all()
         else:
             # Players can only see their own bookings
-            return Booking.objects.filter(player=user)
+            queryset = Booking.objects.filter(player=user)
+        
+        # Automatically update expired bookings to completed
+        Booking.update_expired_bookings()
+        
+        # Apply custom filtering based on query parameters
+        date_gt = self.request.query_params.get('date__gt')
+        date_gte = self.request.query_params.get('date__gte')
+        status_in = self.request.query_params.get('status__in')
+        status = self.request.query_params.get('status')
+        date = self.request.query_params.get('date')
+        
+        if date_gte:
+            # Filter for bookings with date greater than or equal to specified date (current and future bookings)
+            queryset = queryset.filter(date__gte=date_gte)
+        elif date_gt:
+            # Filter for bookings with date greater than specified date (future bookings only)
+            queryset = queryset.filter(date__gt=date_gt)
+        
+        if status_in:
+            # Filter for multiple status values (e.g., 'pending,confirmed')
+            status_list = [s.strip() for s in status_in.split(',')]
+            queryset = queryset.filter(status__in=status_list)
+        
+        if status:
+            # Filter for single status value
+            queryset = queryset.filter(status=status)
+        
+        if date and not date_gt:
+            # Filter for exact date match
+            queryset = queryset.filter(date=date)
+        
+        return queryset
     
     def create(self, request, *args, **kwargs):
         """Create a new booking"""
@@ -503,7 +601,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         """Cancel a booking"""
         booking = self.get_object()
         
+        print(f"DEBUG: Cancel request for booking {booking.id} by user {request.user.username}")
+        print(f"DEBUG: Booking status: {booking.status}")
+        
         if booking.status in ['completed', 'cancelled']:
+            print(f"DEBUG: Cannot cancel booking with status {booking.status}")
             return Response(
                 {"error": "Cannot cancel a completed or already cancelled booking"},
                 status=status.HTTP_400_BAD_REQUEST
@@ -511,41 +613,71 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Check if the user is the player, pitch owner, or an admin
         if request.user not in [booking.player, booking.pitch.owner] and request.user.user_type != 'admin':
+            print(f"DEBUG: User {request.user.username} does not have permission to cancel")
             return Response(
                 {"error": "You don't have permission to cancel this booking"},
                 status=status.HTTP_403_FORBIDDEN
             )
         
+        # Perform the cancellation
         booking.status = 'cancelled'
         booking.save()
+        print(f"DEBUG: Booking {booking.id} status updated to cancelled")
         
         # If payment exists, mark it as refunded
         try:
             payment = booking.payment
             payment.status = 'refunded'
             payment.save()
+            print(f"DEBUG: Payment {payment.id} marked as refunded")
         except Payment.DoesNotExist:
+            print(f"DEBUG: No payment found for booking {booking.id}")
             pass
         
         # Send notification to the other party
-        if request.user == booking.player and booking.pitch.owner.email:
-            subject = f'Booking Cancelled for {booking.pitch.name}'
-            message = f'Your booking for {booking.pitch.name} on {booking.date} from {booking.start_time} to {booking.end_time} has been cancelled by the player.'
-            from_email = settings.DEFAULT_FROM_EMAIL
-            recipient_list = [booking.pitch.owner.email]
-            send_mail(subject, message, from_email, recipient_list)
-        elif request.user == booking.pitch.owner and booking.player.email:
-            subject = f'Booking Cancelled for {booking.pitch.name}'
-            message = f'Your booking for {booking.pitch.name} on {booking.date} from {booking.start_time} to {booking.end_time} has been cancelled by the pitch owner.'
-            from_email = settings.DEFAULT_FROM_EMAIL
-            recipient_list = [booking.player.email]
-            send_mail(subject, message, from_email, recipient_list)
+        try:
+            if request.user == booking.player and booking.pitch.owner.email:
+                subject = f'Booking Cancelled for {booking.pitch.name}'
+                message = f'Your booking for {booking.pitch.name} on {booking.date} from {booking.start_time} to {booking.end_time} has been cancelled by the player.'
+                from_email = settings.DEFAULT_FROM_EMAIL
+                recipient_list = [booking.pitch.owner.email]
+                send_mail(subject, message, from_email, recipient_list)
+                print(f"DEBUG: Cancellation email sent to pitch owner")
+            elif request.user == booking.pitch.owner and booking.player.email:
+                subject = f'Booking Cancelled for {booking.pitch.name}'
+                message = f'Your booking for {booking.pitch.name} on {booking.date} from {booking.start_time} to {booking.end_time} has been cancelled by the pitch owner.'
+                from_email = settings.DEFAULT_FROM_EMAIL
+                recipient_list = [booking.player.email]
+                send_mail(subject, message, from_email, recipient_list)
+                print(f"DEBUG: Cancellation email sent to player")
+        except Exception as e:
+            print(f"DEBUG: Email sending failed: {e}")
+            # Don't fail the cancellation if email fails
+            pass
         
         serializer = self.get_serializer(booking)
+        print(f"DEBUG: Returning cancelled booking data")
         return Response(serializer.data)
     
+    @action(detail=False, methods=['post'])
+    def update_expired(self, request):
+        """Manually trigger update of expired bookings"""
+        # Check if user is admin or owner
+        if request.user.user_type not in ['admin', 'owner']:
+            return Response(
+                {"error": "You don't have permission to update bookings"},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        updated_count = Booking.update_expired_bookings()
+        
+        return Response({
+            "message": f"Successfully updated {updated_count} expired bookings to completed status",
+            "updated_count": updated_count
+        })
+    
     def get_permissions(self):
-        if self.action in ['create', 'confirm', 'cancel']:
+        if self.action in ['create', 'confirm', 'cancel', 'update_expired']:
             permission_classes = [IsAuthenticated]
         else:
             permission_classes = [IsAuthenticated]
@@ -883,6 +1015,14 @@ class MessageViewSet(viewsets.ModelViewSet):
         recipient_ids = request.data.get('recipient_ids', [])
         group_name = request.data.get('group_name')
         
+        print(f"DEBUG: Message creation request data: {request.data}")
+        print(f"DEBUG: Content: {content}")
+        print(f"DEBUG: Recipient ID: {recipient_id}")
+        print(f"DEBUG: Group ID: {group_id}")
+        print(f"DEBUG: Create group and send: {create_group_and_send}")
+        print(f"DEBUG: Recipient IDs: {recipient_ids}")
+        print(f"DEBUG: Group name: {group_name}")
+        
         if not content:
             return Response(
                 {"error": "Message content is required"},
@@ -891,6 +1031,19 @@ class MessageViewSet(viewsets.ModelViewSet):
         
         recipient = None
         group = None
+        
+        # Handle support messages (recipient_id = 'support' or None)
+        if recipient_id == 'support' or recipient_id is None:
+            # Support messages don't need a specific recipient
+            print("DEBUG: Creating support message")
+            message = Message.objects.create(
+                sender=request.user,
+                recipient=None,  # Support messages have no specific recipient
+                group=None,
+                content=content
+            )
+            serializer = self.get_serializer(message)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
         
         # Handle group creation and messaging
         if create_group_and_send:
@@ -904,6 +1057,20 @@ class MessageViewSet(viewsets.ModelViewSet):
                     {"error": "At least one recipient is required when creating a group"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+            
+            # Ensure recipient_ids is a list
+            if isinstance(recipient_ids, str):
+                try:
+                    # Try to parse as JSON
+                    import json
+                    recipient_ids = json.loads(recipient_ids)
+                except (json.JSONDecodeError, ValueError):
+                    # If not JSON, treat as single string
+                    recipient_ids = [recipient_ids]
+            elif not isinstance(recipient_ids, list):
+                recipient_ids = [recipient_ids]
+            
+            print(f"DEBUG: Processed recipient IDs: {recipient_ids}")
             
             # Create the group
             try:
@@ -938,6 +1105,8 @@ class MessageViewSet(viewsets.ModelViewSet):
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
                 
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 return Response(
                     {"error": f"Failed to create group and send message: {str(e)}"},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -962,6 +1131,10 @@ class MessageViewSet(viewsets.ModelViewSet):
         # Check for direct message
         elif recipient_id:
             try:
+                # Handle string recipient IDs
+                if isinstance(recipient_id, str) and recipient_id.isdigit():
+                    recipient_id = int(recipient_id)
+                
                 recipient = User.objects.get(id=recipient_id)
                 # Prevent sending messages to yourself
                 if recipient.id == request.user.id:
@@ -973,6 +1146,11 @@ class MessageViewSet(viewsets.ModelViewSet):
                 return Response(
                     {"error": "Recipient not found"},
                     status=status.HTTP_404_NOT_FOUND
+                )
+            except ValueError:
+                return Response(
+                    {"error": "Invalid recipient ID"},
+                    status=status.HTTP_400_BAD_REQUEST
                 )
         else:
             return Response(
@@ -1002,23 +1180,27 @@ class MessageViewSet(viewsets.ModelViewSet):
             )
         
         # Create the message (for non-group-creation cases)
-        message = Message.objects.create(
-            sender=request.user,
-            recipient=recipient,
-            group=group,
-            content=content
-        )
-        
-        # Send email notification if recipient exists and has email
-        if recipient and recipient.email:
-            subject = f'New Message from {request.user.username}'
-            message_text = f'You have received a new message from {request.user.username}: {content}'
-            from_email = settings.DEFAULT_FROM_EMAIL
-            recipient_list = [recipient.email]
-            send_mail(subject, message_text, from_email, recipient_list)
-        
-        serializer = self.get_serializer(message)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        try:
+            message = Message.objects.create(
+                sender=request.user,
+                recipient=recipient,
+                group=group,
+                content=content
+            )
+            
+            # Send email notification if recipient exists and has email
+            
+            
+            serializer = self.get_serializer(message)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {"error": f"Failed to create message: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     @action(detail=True, methods=['post'])
     def mark_as_read(self, request, pk=None):
